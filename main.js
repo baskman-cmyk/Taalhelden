@@ -1,0 +1,167 @@
+import { loadDatabase } from "./dataLoader.js?v=5.3.0";
+import { loadState, saveState, resetState, defaultState } from "./storage.js?v=5.3.0";
+import { MODE_LABELS, LEVEL_LABELS, MODES, PROGRESS_MODES } from "./config.js?v=5.3.0";
+import { EMBEDDED_DATA } from "./embeddedData.js?v=5.3.0";
+import { Session } from "./session.js?v=5.3.0";
+import { renderQuestion } from "./renderer.js?v=5.3.0";
+import { renderProgress } from "./progress.js?v=5.3.0";
+import { EnglishModule } from "./english.js?v=5.3.0";
+
+const REWARD_TARGET=500;
+const ACTIVE_POINT_BLOCK_MS=10*60*1000;
+const ACTIVE_POINT_VALUE=10;
+const IDLE_TIMEOUT_MS=2*60*1000;
+const MAX_TICK_GAP_MS=5000;
+const ACTIVE_TIME_SAVE_INTERVAL_MS=15000;
+const LEARNING_VIEWS=new Set(["workspace-view","english-view","leesavontuur-view"]);
+let state=loadState(), database, session, curriculum;
+let activeLevel=state.selectedLevel||"gr4";
+let lastLearningActivity=0,lastLearningTick=Date.now(),lastActiveTimeSave=Date.now(),activeTimeTrackerStarted=false;
+const $=id=>document.getElementById(id);
+const on=(id,event,handler)=>{const el=$(id);if(el)el.addEventListener(event,handler);return el;};
+const views=["dashboard-view","workspace-view","english-view","leesavontuur-view","progress-view","goals-view","settings-view"];
+let leesavontuurInitialized=false;
+let englishInitialized=false;
+const ENGLISH_PART_LABELS={words:"Woorden",sentences:"Zinnen",conversations:"Gesprekken",listening:"Luisteren",speaking:"Spreken",situations:"Situaties",roleplay:"Rollenspel",missions:"Vakantiemissie"};
+const show=id=>{views.forEach(v=>$(v).classList.toggle("active",v===id));if(id==="dashboard-view")renderDashboardProgress();if(LEARNING_VIEWS.has(id))markLearningActivity();window.scrollTo({top:0,behavior:"smooth"});};
+function persist(){state.level=Math.floor(state.points/100)+1;saveState(state);syncStats();}
+function syncStats(){
+ $("stat-points").textContent=Number(state.points||0).toLocaleString("nl-NL",{maximumFractionDigits:1});$("stat-rewards").textContent=state.rewards;
+ const within=state.rewardProgress||0;const withinText=Number(within).toLocaleString("nl-NL",{maximumFractionDigits:1});$("reward-progress-text").textContent=`${withinText} / ${REWARD_TARGET} punten`;$("reward-progress-fill").style.width=`${Math.min(100,within/REWARD_TARGET*100)}%`;
+ renderDashboardProgress();
+}
+function renderDashboardProgress(){
+ const root=$("dashboard-progress");if(!root)return;
+ const shown=PROGRESS_MODES.filter(m=>m!=="woordtrainer" && state.progress[m]);
+ root.innerHTML=shown.map(mode=>{const d=state.progress[mode];const pct=d.answered?Math.round(d.correct/d.answered*100):0;return `<div class="dashboard-progress-row"><div><span>${MODE_LABELS[mode]}</span><strong>${pct}%</strong></div><div class="mini-meter"><div style="width:${pct}%"></div></div></div>`;}).join("");
+}
+function applySettings(){document.documentElement.dataset.theme=state.settings.theme;$("theme-select").value=state.settings.theme;$("speech-rate").value=String(state.settings.rate);const length=$("session-length");if(length)length.value=String(state.settings.sessionLength);}
+function reward(){ $("reward-dialog").hidden=false; }
+function activeLearningView(){
+ if(document.visibilityState!=="visible"||!$("reward-dialog")?.hidden)return null;
+ return [...LEARNING_VIEWS].map($).find(view=>view?.classList.contains("active"))||null;
+}
+function markLearningActivity(event){
+ const view=activeLearningView();
+ if(!view)return;
+ if(event?.target&&!view.contains(event.target))return;
+ lastLearningActivity=Date.now();
+}
+function awardActiveTimePoints(points){
+ if(points<=0)return;
+ state.points=(Number(state.points)||0)+points;
+ state.rewardProgress=(Number(state.rewardProgress)||0)+points;
+ while(state.rewardProgress>=REWARD_TARGET){state.rewardProgress-=REWARD_TARGET;state.rewards++;reward();}
+ persist();
+}
+function tickActiveLearningTime(){
+ const now=Date.now(),elapsed=now-lastLearningTick;
+ lastLearningTick=now;
+ if(!activeLearningView()||!lastLearningActivity||now-lastLearningActivity>IDLE_TIMEOUT_MS||elapsed<=0||elapsed>MAX_TICK_GAP_MS)return;
+ state.activePointMs=(Number(state.activePointMs)||0)+elapsed;
+ const blocks=Math.floor(state.activePointMs/ACTIVE_POINT_BLOCK_MS);
+ if(blocks>0){
+  state.activePointMs-=blocks*ACTIVE_POINT_BLOCK_MS;
+  awardActiveTimePoints(blocks*ACTIVE_POINT_VALUE);
+  lastActiveTimeSave=now;
+ }else if(now-lastActiveTimeSave>=ACTIVE_TIME_SAVE_INTERVAL_MS){
+  saveState(state);
+  lastActiveTimeSave=now;
+ }
+}
+function startActiveTimeTracking(){
+ if(activeTimeTrackerStarted)return;
+ activeTimeTrackerStarted=true;
+ ["pointerdown","keydown","input"].forEach(type=>document.addEventListener(type,markLearningActivity,true));
+ document.addEventListener("visibilitychange",()=>{lastLearningTick=Date.now();if(document.visibilityState!=="visible")saveState(state);});
+ window.addEventListener("pagehide",()=>saveState(state));
+ window.setInterval(tickActiveLearningTime,1000);
+}
+function renderGoals(){const info=curriculum?.leerlijn?.[activeLevel]||{};const sections=Object.entries(info).map(([key,items])=>`<article class="settings-card"><h3>${key[0].toUpperCase()+key.slice(1)}</h3><ul>${items.map(x=>`<li>${x}</li>`).join("")}</ul></article>`).join("");$("goals-content").innerHTML=`<div class="exercise-box"><strong>${LEVEL_LABELS[activeLevel]}</strong><p>De oefeningen zijn eigen materiaal en afgestemd op de SLO-kerndoelen, referentieniveaus en gangbare taalmethodes.</p></div>${sections}`;}
+function loadCurrent(){
+ const q=session.current(),total=session.questions.length,isTrainer=session.mode==="woordtrainer";
+ $("workspace-title").textContent=isTrainer?`Woordjes trainen – kaart ${session.index+1} van ${total}`:`${MODE_LABELS[session.mode]} – vraag ${session.index+1} van ${total}`;
+ $("workspace-subtitle").textContent=isTrainer?`${LEVEL_LABELS[session.level]} · tik op de kaart om hem om te draaien`:LEVEL_LABELS[session.level];
+ $("workspace-progress").style.width=`${(session.index+1)/total*100}%`;$("workspace-feedback").className="feedback";$("workspace-feedback").textContent="";
+ $("btn-submit-answer").style.display=isTrainer?"none":"inline-block";$("btn-next-question").style.display=isTrainer?"inline-block":"none";$("btn-next-question").textContent=isTrainer?(session.index===total-1?"Klaar":"Volgende kaart"):"Volgende";
+ renderQuestion({question:q,mode:session.mode,settings:state.settings,onOption:v=>session.select(v),onWord:(i,on)=>session.selectIndex(i,on),onSubmit:evaluate});
+}
+function evaluate(){const input=$("dictee-input")?.value||"",result=session.evaluate(input),feedback=$("workspace-feedback");if(result?.missing){feedback.className="feedback notice";feedback.textContent="Kies eerst een antwoord.";return;}if(!result)return;feedback.className=`feedback ${result.correct?"success":"error"}`;feedback.textContent=result.correct?(result.reward?"Goed gedaan! Je hebt een beloning verdiend.":"Goed gedaan!"):`Het juiste antwoord is: ${result.answer}`;$("btn-submit-answer").style.display="none";$("btn-next-question").style.display="inline-block";}
+function finishSession(){session.finish();$("workspace-progress").style.width="100%";const trainer=session.mode==="woordtrainer";$("dynamic-content").innerHTML=`<div class="exercise-box finish-box"><h2>${trainer?"🃏 Kaarten bekeken":"🏆 Oefening afgerond"}</h2><p>${trainer?`Je hebt ${session.questions.length} woordkaarten bekeken. Je actieve oefentijd telt mee voor punten.`:`Je had <strong>${session.score} van de ${session.questions.length}</strong> vragen goed.`}</p><button id="finish-home" class="button primary">Naar hoofdpagina</button></div>`;$("workspace-feedback").className="feedback";$("btn-submit-answer").style.display="none";$("btn-next-question").style.display="none";on("finish-home","click",()=>show("dashboard-view"));}
+function next(){if(session.next())loadCurrent();else finishSession();}
+function clearProgress(){const fresh=defaultState();state.progress=fresh.progress;state.english=fresh.english;state.history=[];state.streak=0;persist();if(englishInitialized)EnglishModule.reset();}
+function recordEnglishAnswer(part,theme,correct,stars=0){
+ const english=state.english;
+ const detail=english.progress[part];
+ detail.answered++;if(correct)detail.correct++;detail.stars=(detail.stars||0)+(stars||0);
+ if(theme&&english.themeProgress[theme]){english.themeProgress[theme].answered++;if(correct)english.themeProgress[theme].correct++;}
+ const aggregate=state.progress.engels;
+ aggregate.answered++;if(correct)aggregate.correct++;
+ persist();
+}
+function completeEnglishSession(part,score,total){
+ const detail=state.english.progress[part];if(detail)detail.sessions++;
+ state.progress.engels.sessions++;
+ state.streak++;
+ state.history.push({date:new Date().toLocaleDateString("nl-NL"),mode:`Engels · ${ENGLISH_PART_LABELS[part]||"Oefenen"}`,level:LEVEL_LABELS[activeLevel],score:`${score} / ${total}`});
+ persist();
+}
+function addLeesavontuurPoint(points=1,story){
+ state.progress.leesavontuur=state.progress.leesavontuur||{answered:0,correct:0,sessions:0,points:0};
+ state.progress.leesavontuur.points=(state.progress.leesavontuur.points||0)+points;
+ persist();
+}
+function completeLeesavontuur(result){
+ const p=state.progress.leesavontuur||(state.progress.leesavontuur={answered:0,correct:0,sessions:0,points:0});
+ p.answered+=(result.answered||0);
+ p.correct+=(result.correct||0);
+ p.sessions++;
+ state.streak++;
+ state.history.push({
+   date:new Date().toLocaleDateString("nl-NL"),
+   mode:MODE_LABELS.leesavontuur,
+   level:result.story?.level||"Alle groepen",
+   score:`${result.correct||0} / ${result.answered||0}`
+ });
+ persist();
+}
+function openLeesavontuur(){
+ show("leesavontuur-view");
+ if(!leesavontuurInitialized&&window.Leesavontuur){window.Leesavontuur.init({root:"#leesavontuur-root",onPointsEarned:addLeesavontuurPoint,onStoryCompleted:completeLeesavontuur});leesavontuurInitialized=true;}
+}
+function openEnglish(){
+ show("english-view");
+ if(!englishInitialized){
+  EnglishModule.init({root:"#english-root",getState:()=>state,getRate:()=>state.settings.rate,getWords:chosenLevel=>database?.[chosenLevel]?.engels||[],onAnswer:recordEnglishAnswer,onComplete:completeEnglishSession,onSave:persist});
+  englishInitialized=true;
+ }
+ EnglishModule.open(activeLevel);
+}
+function events(){
+ document.querySelectorAll('[data-view="english"]').forEach(b=>b.addEventListener("click",openEnglish));
+ document.querySelectorAll('[data-view="leesavontuur"]').forEach(b=>b.addEventListener("click",openLeesavontuur));
+ document.querySelectorAll("[data-mode]").forEach(b=>b.addEventListener("click",()=>{window.speechSynthesis?.cancel();const root=$("dynamic-content");if(root)root.innerHTML="";session.start(b.dataset.mode,activeLevel);show("workspace-view");loadCurrent();}));
+ document.querySelectorAll("[data-level]").forEach(b=>b.addEventListener("click",()=>{activeLevel=b.dataset.level;state.selectedLevel=activeLevel;document.querySelectorAll("[data-level]").forEach(x=>x.classList.toggle("active",x===b));const label=$("active-level-name");if(label)label.textContent=LEVEL_LABELS[activeLevel];persist();}));
+ document.querySelectorAll(".back-button").forEach(b=>b.addEventListener("click",()=>{window.speechSynthesis?.cancel();show("dashboard-view");}));
+ document.querySelectorAll('[data-view="progress"]').forEach(b=>b.addEventListener("click",()=>{renderProgress(state,$("progress-overview"),$("history-rows"));show("progress-view");}));
+ document.querySelectorAll('[data-view="goals"]').forEach(b=>b.addEventListener("click",()=>{renderGoals();show("goals-view");}));
+ document.querySelectorAll('[data-view="settings"]').forEach(b=>b.addEventListener("click",()=>show("settings-view")));
+ on("btn-submit-answer","click",evaluate);on("btn-next-question","click",next);
+ on("theme-select","change",e=>{state.settings.theme=e.target.value;applySettings();persist();});
+ on("speech-rate","change",e=>{state.settings.rate=Number(e.target.value);persist();});
+ on("session-length","change",e=>{state.settings.sessionLength=Number(e.target.value);persist();});
+ on("btn-points-reset","click",()=>{if(confirm("Alleen de punten en de voortgang naar de volgende beloning wissen? Behaalde beloningen en leerresultaten blijven bewaard.")){state.points=0;state.rewardProgress=0;state.activePointMs=0;persist();alert("De punten zijn gewist.");}});
+ on("btn-rewards-reset","click",()=>{if(confirm("Alleen het aantal behaalde beloningen wissen? Punten en leerresultaten blijven bewaard.")){state.rewards=0;persist();alert("De beloningen zijn gewist.");}});
+ on("btn-progress-reset","click",()=>{if(confirm("Alle leerresultaten en sessiegeschiedenis wissen? Punten en beloningen blijven bewaard.")){clearProgress();alert("De voortgang is gewist.");}});
+ on("btn-hard-reset","click",()=>{if(confirm("Alle punten, beloningen, instellingen en leerresultaten wissen?")){state=resetState();session.state=state;if(englishInitialized)EnglishModule.reset();applySettings();syncStats();alert("Alle gegevens zijn gewist.");}});
+ on("reward-close","click",()=>{const d=$("reward-dialog");if(d)d.hidden=true;});
+ const infoDialog=$("app-info-dialog");
+ const closeInfo=()=>{if(!infoDialog)return;infoDialog.hidden=true;document.body.classList.remove("modal-open");};
+ on("btn-app-info","click",()=>{if(!infoDialog)return;infoDialog.hidden=false;document.body.classList.add("modal-open");});
+ on("app-info-close","click",closeInfo);on("app-info-close-bottom","click",closeInfo);
+ if(infoDialog)infoDialog.addEventListener("click",e=>{if(e.target===infoDialog)closeInfo();});
+ document.addEventListener("keydown",e=>{if(e.key==="Escape"&&infoDialog&&!infoDialog.hidden)closeInfo();});
+ document.querySelectorAll("[data-info-tab]").forEach(button=>button.addEventListener("click",()=>{const selected=button.dataset.infoTab;document.querySelectorAll("[data-info-tab]").forEach(tab=>tab.classList.toggle("active",tab===button));document.querySelectorAll("[data-info-panel]").forEach(panel=>panel.classList.toggle("active",panel.dataset.infoPanel===selected));}));
+}
+async function init(){applySettings();syncStats();$("active-level-name").textContent=LEVEL_LABELS[activeLevel];document.querySelectorAll("[data-level]").forEach(x=>x.classList.toggle("active",x.dataset.level===activeLevel));try{database=await loadDatabase();curriculum=EMBEDDED_DATA.curriculum;session=new Session(database,state,persist,reward);events();startActiveTimeTracking();$("loading-overlay").classList.add("hidden");}catch(error){console.error(error);$("loading-overlay").innerHTML=`<div class="load-error"><strong>De oefeningen konden niet worden geladen.</strong><p>Open de volledige uitgepakte map via een lokale webserver.</p><small>${String(error.message||error)}</small></div>`;}}
+init();
